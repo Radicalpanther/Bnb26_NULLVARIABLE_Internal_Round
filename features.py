@@ -2,6 +2,7 @@
 import json, re
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
 
 STEP_TYPES = ["plan", "select_tool", "call_tool", "read_result", "write_answer"]
 TOOLS = ["search", "calculator", "database_lookup", "none"]
@@ -20,7 +21,7 @@ def _norm_input(t):            # drop "[Attempt 2/Retry]" tags so repeated calls
     return re.sub(r"\[attempt[^\]]*\]", "", str(t).lower()).strip()
 
 def fit_normal_stats(ok_steps):
-    """Mean/std of latency and output length per (step_type, tool) from SUCCESSFUL runs only."""
+    """Mean/std of latency and output length per (step_type, tool) from SUCCESSFUL runs only + IsolationForest."""
     ok = ok_steps.copy()
     ok["tool_name"] = ok["tool_name"].fillna("none")
     stats = {}
@@ -29,6 +30,11 @@ def fit_normal_stats(ok_steps):
         for (st, tn), g in ok.groupby(["step_type", "tool_name"])[col]:
             d[f"{st}|{tn}"] = [float(g.mean()), float(g.std(ddof=0))]
         stats[col] = d
+
+    # IsolationForest for anomaly detection
+    iso = IsolationForest(n_estimators=100, contamination=0.01, random_state=0)
+    iso.fit(ok[["latency_ms", "output_length"]])
+    stats["iso"] = iso
     return stats
 
 def _z(stats, col, st, tn, val):   # z-score = how many standard deviations from normal
@@ -40,9 +46,10 @@ def _parse_deps(x):
 
 def feature_names():
     base = ["step_index", "rel_pos", "steps_left", "n_steps", "latency_ms", "output_length",
-            "error_flag", "retry_count", "lat_z", "len_z", "err_words", "is_empty",
+            "error_flag", "retry_count", "lat_z", "len_z", "err_words",
             "flag_any", "prior_flags", "is_first_flag", "repeat_count",
-            "overlap_next_in", "overlap_final", "n_deps", "n_dependents", "dep_flags", "n_extracted"]
+            "overlap_next_in", "overlap_final", "n_deps", "n_dependents", "dep_flags", "n_extracted",
+            "anomaly_score", "input_covers_goal", "answer_matches_state"]
     lags = [f"{p}_{c}" for c in LAG_COLS for p in ("prev", "next")]
     onehot = [f"st_{s}" for s in STEP_TYPES] + [f"tool_{t}" for t in TOOLS] + [f"task_{t}" for t in TASKS]
     return base + lags + onehot
@@ -56,12 +63,40 @@ def build_features(steps, stats):
     snap = df["state_snapshot"].apply(lambda s: json.loads(s) if isinstance(s, str) else {})
     df["task_type"] = snap.apply(lambda d: d.get("task_type", "unknown"))
     df["n_extracted"] = snap.apply(lambda d: len(d.get("extracted_values", {})))
+    df["extracted_values_dict"] = snap.apply(lambda d: d.get("extracted_values", {}))
 
     df["lat_z"] = [_z(stats, "latency_ms", a, b, c) for a, b, c in zip(df.step_type, df.tool_name, df.latency_ms)]
     df["len_z"] = [_z(stats, "output_length", a, b, c) for a, b, c in zip(df.step_type, df.tool_name, df.output_length)]
     df["err_words"] = df.output_text.str.contains(ERR_PATTERN, case=False, regex=True).astype(int)
-    df["is_empty"] = (df.output_text.str.strip().str.len() == 0).astype(int)
     df["flag_any"] = ((df.error_flag == 1) | (df.err_words == 1)).astype(int)
+
+    df["anomaly_score"] = stats["iso"].decision_function(df[["latency_ms", "output_length"]])
+
+    df["input_covers_goal"] = [
+        (len(set(re.findall(r"\d+|[A-Z][a-z]+", inp)) & set(re.findall(r"\d+|[A-Z][a-z]+", goal))) / max(len(set(re.findall(r"\d+|[A-Z][a-z]+", goal))), 1))
+        if step_type == "call_tool" else 0
+        for inp, goal, step_type in zip(df.input_text, snap.apply(lambda d: d.get("goal", "")), df.step_type)
+    ]
+
+    def _parse_floats(text):
+        # Find all numbers including those with commas and decimals
+        nums = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?", text)
+        return [float(n.replace(",", "")) for n in nums]
+
+    def _match_state(row):
+        if row["step_type"] != "write_answer": return 0
+        vals = row["extracted_values_dict"]
+        ans = row["output_text"]
+        ans_nums = _parse_floats(ans)
+        state_vals = [float(v) for v in vals.values() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit() or (isinstance(v, str) and v.replace(',', '').replace('.', '', 1).isdigit())]
+
+        matches = 0
+        for an in ans_nums:
+            if any(abs(an - sv) < 1e-3 for sv in state_vals):
+                matches += 1
+        return matches / len(ans_nums) if ans_nums else 0
+
+    df["answer_matches_state"] = df.apply(_match_state, axis=1)
 
     g = df.groupby("run_id")
     df["n_steps"] = g.step_index.transform("count")

@@ -730,9 +730,13 @@ def generate_single_run(
         "status": "in_progress"
     }
 
-    # Decide if a harmless retry happens in this run (for realism and step count variance)
-    # Harmless retries occur in ~20% of successful runs and ~10% of failing runs
+    # Decide if a harmless retry happens in this run
     has_harmless_retry = (not should_fail and rng.random() < 0.20) or (should_fail and fault_type not in ["retry_loop", "context_ignored"] and rng.random() < 0.12)
+
+    # NEW: Decide if this run has quiet fault or decoys
+    is_quiet_fault = (should_fail and rng.random() < 0.30)
+    has_decoy = (rng.random() < 0.25)
+    decoy_step_idx = rng.randint(0, 3) if has_decoy else -1
 
     # -------------------------------------------------------------
     # STEP 0: PLAN
@@ -776,6 +780,15 @@ def generate_single_run(
             break
 
         is_this_hop_faulty = should_fail and (hop_idx == fault_hop_idx)
+
+        # Apply quiet fault: force error_flag to 0 and ensure plausible output if it's the root cause
+        if is_quiet_fault and is_this_hop_faulty:
+             # We will handle it by setting error_flag to 0 later
+             actual_error_flag = 0
+             # Modify output_text to be plausible but wrong at the end of the hop logic or by modifying `step`
+        else:
+             actual_error_flag = 1
+
         hop_tool = hop["tool_name"]
         hop_query = hop["query"]
         hop_raw = hop["raw_result"]
@@ -795,11 +808,17 @@ def generate_single_run(
             chosen_tool = rng.choice(wrong_candidates)
             is_rc = 1
             root_cause_index = step_idx
-            # Root cause error_flag: ~40% noisy
-            err_flag = 1 if rng.random() < 0.40 else 0
-            lat = rng.uniform(140, 320)
+            if is_quiet_fault and is_this_hop_faulty:
+                # Quiet fault: plausible output, nominal latency, NO error_flag
+                err_flag = 0
+                lat = rng.uniform(150, 400)
+                out_text = f"Selected tool: '{chosen_tool}'. Decision reasoning: Best fit for task requirements." # Normal-looking reasoning
+            else:
+                # Actual fault: noisy error flag, high latency
+                err_flag = 1 if rng.random() < 0.40 else 0
+                lat = rng.uniform(140, 320)
+                out_text = _pick_template(_SELECT_TOOL_WRONG_TEMPLATES, rng, tool=chosen_tool)
 
-            out_text = _pick_template(_SELECT_TOOL_WRONG_TEMPLATES, rng, tool=chosen_tool)
             current_state["current_tool"] = chosen_tool
 
             steps.append(create_step(
