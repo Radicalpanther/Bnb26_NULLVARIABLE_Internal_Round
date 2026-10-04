@@ -147,7 +147,7 @@ def explain_rows(bundle: dict, df) -> list[list[str]]:
         pos_indices = [idx for idx in sorted_indices if row_sv[idx] > 0][:3]
         if not pos_indices:
             # Fallback to top feature(s) if none strictly positive
-            pos_indices = sorted_indices[:3].tolist()
+            pos_indices = [int(i) for i in sorted_indices[:3]]
             
         row_evidence = []
         for idx in pos_indices:
