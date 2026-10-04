@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query, Body, HTTPException
 from pydantic import BaseModel, Field
 
 from features import build_features
-from explain import explain_rows, write_explanation
+from explain import explain_rows, write_explanation_with_source
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
@@ -188,7 +188,7 @@ def diagnose_run(
 
     # Generate explanation for top diagnosed root cause step
     top_step = ranked_steps[0]
-    explanation, explanation_source = write_explanation(
+    explanation, explanation_source = write_explanation_with_source(
         step_type=top_step["step_type"],
         step_index=top_step["step_index"],
         evidence=top_step["evidence"],

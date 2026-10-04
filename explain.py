@@ -11,12 +11,12 @@ logger = logging.getLogger("explain")
 
 # Mapping of feature names to human-readable explanation templates
 FEATURE_PHRASES = {
-    "lat_z": "latency was {v:.1f} standard deviations above normal",
+    "lat_z": "{v:.1f} standard deviations above normal",
     "err_words": "the output contained error wording",
     "repeat_count": "the same call was made earlier",
     "dep_flags": "later steps that used its output look suspicious",
     "anomaly_score": "the step looks unusual compared with successful runs",
-    "len_z": "output length was {v:.1f} standard deviations from normal",
+    "len_z": "{v:.1f} standard deviations above normal",
     "error_flag": "an error flag was raised",
     "flag_any": "an error or warning condition was flagged",
     "is_first_flag": "first step in the run to show an error or warning",
@@ -40,6 +40,21 @@ FEATURE_PHRASES = {
     "retry_count": "step was retried {v:.0f} times",
     "output_length": "output length was {v:.0f} characters",
     "latency_ms": "latency was {v:.1f} ms",
+}
+
+EVIDENCE_WHITELIST = {
+    "lat_z",
+    "len_z",
+    "err_words",
+    "error_flag",
+    "repeat_count",
+    "retry_count",
+    "dep_flags",
+    "is_first_flag",
+    "anomaly_score",
+    "overlap_next_in",
+    "answer_matches_state",
+    "input_covers_goal",
 }
 
 def format_evidence(feature_name: str, value: float) -> str:
@@ -99,14 +114,34 @@ def explain_rows(bundle: dict, df) -> list[list[str]]:
     explainer = shap.TreeExplainer(model)
     raw_sv = explainer.shap_values(X)
     pos_sv = _extract_positive_shap_values(raw_sv)
+    last_in_run = df.groupby("run_id", sort=False).cumcount(ascending=False).eq(0)
 
     all_evidence = []
     for i in range(len(X)):
         row_sv = pos_sv[i]
         row_x = X.iloc[i]
+        step_type = df["step_type"].iloc[i]
         
-        # Sort feature indices by SHAP contribution descending
-        sorted_indices = np.argsort(-row_sv)
+        # Filter features before ranking so disallowed features cannot displace evidence.
+        candidate_indices = []
+        for idx, feature_name in enumerate(features):
+            if feature_name not in EVIDENCE_WHITELIST:
+                continue
+            value = float(row_x.iloc[idx])
+            if feature_name in {"lat_z", "len_z"} and value < 1:
+                continue
+            if feature_name == "overlap_next_in" and (
+                value >= 0.02 or last_in_run.iloc[i]
+            ):
+                continue
+            if feature_name == "answer_matches_state" and step_type != "write_answer":
+                continue
+            if feature_name == "input_covers_goal" and (
+                step_type != "call_tool" or value >= 0.5
+            ):
+                continue
+            candidate_indices.append(idx)
+        sorted_indices = sorted(candidate_indices, key=lambda idx: row_sv[idx], reverse=True)
         
         # Select top 3 features that pushed the score UP (shap value > 0)
         pos_indices = [idx for idx in sorted_indices if row_sv[idx] > 0][:3]
@@ -118,13 +153,6 @@ def explain_rows(bundle: dict, df) -> list[list[str]]:
         for idx in pos_indices:
             feat_name = features[idx]
             val = row_x.iloc[idx]
-            if feat_name == "overlap_final":
-                continue
-            if feat_name == "overlap_next_in":
-                if float(val) >= 0.02 or float(df["steps_left"].iloc[i]) == 0:
-                    continue
-            if feat_name == "answer_matches_state" and df["step_type"].iloc[i] != "write_answer":
-                continue
             row_evidence.append(format_evidence(feat_name, val))
             
         all_evidence.append(row_evidence)
@@ -133,7 +161,7 @@ def explain_rows(bundle: dict, df) -> list[list[str]]:
 
 
 def fallback_explanation(
-    step_type: str, step_index: int, evidence: list[str], rank_one: bool = True
+    step_type: str, step_index: int, evidence: list[str], rank_one: bool = False
 ) -> str:
     """Generate a reliable fallback explanation template."""
     if rank_one and len(evidence) >= 2:
@@ -172,13 +200,13 @@ def _valid_llm_reply(reply: str, step_type: str, step_index: int, evidence: list
     return True
 
 
-def write_explanation(
+def write_explanation_with_source(
     step_type: str,
     step_index: int,
     evidence: list[str],
     use_llm: bool = True,
     output_snippet: str = "",
-    rank_one: bool = True,
+    rank_one: bool = False,
 ) -> tuple[str, str]:
     """
     Call Ollama Gemma 2B to synthesize a 2-sentence explanation from facts.
@@ -215,3 +243,16 @@ def write_explanation(
         logger.warning(f"Ollama generation failed or timed out: {e}")
 
     return fallback_explanation(step_type, step_index, evidence, rank_one), "template"
+
+
+def write_explanation(
+    step_type: str,
+    step_index: int,
+    evidence: list[str],
+    use_llm: bool = True,
+) -> str:
+    """Return an explanation while retaining the original string API."""
+    explanation, _ = write_explanation_with_source(
+        step_type, step_index, evidence, use_llm
+    )
+    return explanation
